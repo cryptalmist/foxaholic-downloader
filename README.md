@@ -36,14 +36,15 @@ python foxaholic.py "https://www.foxaholic.com/novel/<slug>/" --uc --list-only
 Output (`out/<Novel Title>/`):
 
 ```text
-chapter-0001.md   # chapter-name line + body (also the resume cache)
-...
-images/           # downloaded illustrations, referenced from the .md files
-<Title>.txt       # whole novel, plain text ([Image: ...] placeholders)
-<Title>.epub      # e-reader format, images embedded
-<Title>.pdf       # one PDF, images embedded, new page per chapter
+md/
+  chapter-0001.md   # chapter-name line + body (also the resume cache)
+  ...
+  images/           # illustrations, referenced from the .md files
+<Title>.txt         # whole novel, plain text ([Image: ...] placeholders)
+<Title>.epub        # e-reader format, images embedded
+<Title>.pdf         # one PDF, images embedded, new page per chapter
 metadata.json
-failed.json       # only if chapters still failed: re-run to retry them
+failed.json         # only if chapters still failed: re-run to retry them
 ```
 
 ## How it works

@@ -7,31 +7,23 @@ which is protected by Cloudflare "Just a moment" challenge.
 
 Built with Muse Spark via OpenCode.
 
-Why Playwright and not requests?
+Why a real browser and not requests?
   Simple HTTP (requests / curl / gallery-dl) gets HTTP 403 + Cloudflare
-  challenge page. You need a real Chromium to pass it. This script uses
-  a *persistent* browser profile, so you solve the challenge once
-  (with --headed) and the cf_clearance cookie is reused afterwards.
+  challenge page. This script drives real Chrome via SeleniumBase
+  undetected-chromedriver (SB(uc=True) + uc_gui_handle_captcha) and reuses
+  the clearance cookies for fast parallel downloads.
 
 Usage:
-  pip install -r requirements.txt
-  python -m playwright install chromium   # once (or: playwright install chrome)
+  pip install -r requirements.txt   # seleniumbase + requests + fpdf2
 
-  # first run - headed so you can solve Cloudflare if prompted:
-  python foxaholic.py "https://www.foxaholic.com/novel/<slug>/" --headed
+  # peek at chapters:
+  python foxaholic.py "https://www.foxaholic.com/novel/<slug>/" --list-only
 
-  # later runs can be headless, resume automatically:
-  python foxaholic.py "https://www.foxaholic.com/novel/<slug>/" -o out
-
-  # only list chapters:
-  python foxaholic.py "URL" --list-only
+  # full download (all formats):
+  python foxaholic.py "https://www.foxaholic.com/novel/<slug>/" --workers 20
 
   # chapter range + formats:
-  python foxaholic.py "URL" --from 1 --to 50 --format epub,txt,md --delay 1.5
-
-  # UC mode (SeleniumBase undetected-chromedriver, stronger Cloudflare bypass):
-  #   pip install seleniumbase
-  #   python foxaholic.py "URL" --uc --headed
+  python foxaholic.py "URL" --from 1 --to 50 --format epub,pdf --delay 1.5
 
 Output:
   out/<Novel Title>/
@@ -91,7 +83,7 @@ TITLE_SELECTORS = [
 
 CLOUDFLARE_TITLE_HINTS = ("just a moment", "attention required", "verifying you are human")
 
-PLAYWRIGHT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                  "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
 
@@ -288,37 +280,15 @@ class _UCPage:
 
 @contextmanager
 def _open_page(args, script_dir: Path):
-    """Yield (page, close_fn). SeleniumBase UC mode with --uc, else Playwright."""
-    if args.uc:
-        try:
-            from seleniumbase import SB
-        except ImportError:
-            raise ImportError("ERROR: seleniumbase is not installed.\n  pip install seleniumbase")
-        print(f"[browser] launching UC-mode chromium ({'headed' if args.headed else 'headless'}) ...")
-        with SB(uc=True, headless=not args.headed) as driver:
-            upage = _UCPage(driver)
-            yield upage, lambda: None, upage.get_cookies, upage.user_agent()
-        return
+    """Yield (page, close_fn, cookies_fn, ua) via SeleniumBase UC mode (always)."""
     try:
-        from playwright.sync_api import sync_playwright
+        from seleniumbase import SB
     except ImportError:
-        raise ImportError("ERROR: Playwright is not installed.\n"
-                          "  pip install -r requirements.txt\n"
-                          "  python -m playwright install chromium")
-    profile_dir = Path(args.user_data_dir) if args.user_data_dir else (script_dir / ".foxaholic-profile")
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    with sync_playwright() as pw:
-        print(f"[browser] launching {'headed' if args.headed else 'headless'} chromium (profile: {profile_dir}) ...")
-        context = pw.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            headless=not args.headed,
-            args=["--disable-blink-features=AutomationControlled"],
-            viewport={"width": 1366, "height": 900},
-            user_agent=PLAYWRIGHT_UA,
-        )
-        page = context.pages[0] if context.pages else context.new_page()
-        page.set_default_navigation_timeout(args.chapter_timeout)
-        yield page, context.close, context.cookies, PLAYWRIGHT_UA
+        raise ImportError("ERROR: seleniumbase is not installed.\n  pip install seleniumbase")
+    print(f"[browser] launching UC-mode chromium ({'headed' if args.headed else 'headless'}) ...")
+    with SB(uc=True, headless=not args.headed) as driver:
+        upage = _UCPage(driver)
+        yield upage, lambda: None, upage.get_cookies, upage.user_agent()
 
 
 # ---------------------------------------------------------------- helpers
@@ -348,6 +318,19 @@ def _best_title(h1title: str, listname: str, idx: int) -> str:
     if b and a.startswith(b):
         return a
     return a or b
+
+
+def _md_path(book_dir, idx):
+    """Path for a chapter md, migrating old flat layout (book_dir/x.md) into md/."""
+    newp = Path(book_dir) / "md" / f"chapter-{idx:04d}.md"
+    oldp = Path(book_dir) / f"chapter-{idx:04d}.md"
+    if not newp.exists() and oldp.exists():
+        try:
+            newp.parent.mkdir(parents=True, exist_ok=True)
+            oldp.rename(newp)
+        except Exception:
+            return oldp
+    return newp
 
 
 def _read_cached_md(md_path, chapter_name: str = "") -> list[str]:
@@ -443,6 +426,64 @@ def extract_novel_title(page) -> str:
     return slug_from_url(page.url)
 
 
+def extract_novel_meta(page) -> dict:
+    """Title, original title, author, team, genres, status, type, synopsis, cover.
+
+    Parsed from raw HTML with regex (single snapshot, no extra roundtrips —
+    live element handles go stale when the page JS re-renders).
+    """
+    meta = {"title": "", "original_title": "", "author": [],
+            "team": [], "genres": [], "tags": [], "status": "", "translation": "",
+            "type": "", "synopsis": [], "cover_url": ""}
+    try:
+        meta["title"] = extract_novel_title(page)
+    except Exception:
+        pass
+    try:
+        html_text = page.content()
+    except Exception:
+        return meta
+
+    def _links(content: str) -> list:
+        return [t for t in (_strip_tags(m) for m in re.findall(r"(?is)<a\b[^>]*>(.*?)</a>", content)) if t]
+
+    for m in re.finditer(r"(?is)<div\s+class=\"post-content_item\">.*?<h5\b[^>]*>(.*?)</h5>"
+                         r".*?<div\s+class=\"summary-content\">(.*?)</div>\s*</div>", html_text):
+        head = _strip_tags(m.group(1)).strip().lower()
+        content = m.group(2)
+        links = _links(content)
+        text = _strip_tags(content).strip()
+        if "genre" in head:
+            meta["genres"] = links or ([text] if text else [])
+        elif "tag" in head:
+            meta["tags"] = links or ([text] if text else [])
+        elif "author" in head:
+            meta["author"] = links or ([text] if text else [])
+        elif "team" in head or "artist" in head:
+            meta["team"] = links or ([text] if text else [])
+        elif "translation" in head:
+            meta["translation"] = links[0] if links else text.split("\n")[0].strip()
+        elif head == "novel" or "status" in head:
+            meta["status"] = links[0] if links else text.split("\n")[0].strip()
+        elif head == "type":
+            meta["type"] = links[0] if links else text.split("\n")[0].strip()
+        elif head == "title" and not meta["original_title"]:
+            meta["original_title"] = text.split("\n")[0].strip()
+
+    m = re.search(r"(?is)<div\s+class=\"description-summary\">(.*?)<div\s+class=\"c-blog__heading\b[^\"]*\"",
+                    html_text)
+    seg = m.group(1) if m else ""
+    for pm in re.finditer(r"(?is)<p\b[^>]*>(.*?)</p>", seg):
+        t = _strip_tags(pm.group(1)).replace("\xa0", " ").strip()
+        if t and t not in meta["synopsis"]:
+            meta["synopsis"].append(t)
+
+    m = re.search(r"(?is)summary_image.*?<img\b[^>]*?(?:data-src|src)\s*=\s*[\"']([^\"']+)[\"']", html_text)
+    if m:
+        meta["cover_url"] = m.group(1).strip()
+    return meta
+
+
 def extract_chapter_links(page, novel_url: str) -> list[dict]:
     """Return [{'url': ..., 'name': ...}] sorted oldest->newest."""
     found: dict[str, str] = {}
@@ -493,13 +534,13 @@ def extract_chapter_links(page, novel_url: str) -> list[dict]:
 # ---------------------------------------------------------------- epub (no deps)
 
 
-def _para_to_xhtml(p: str, book_dir: Path, img_items: dict) -> str:
+def _para_to_xhtml(p: str, md_dir: Path, img_items: dict) -> str:
     """One md para -> xhtml. Registers `![..](images/..)` refs into img_items."""
     segs, last = [], 0
     for mo in _IMG_MD_RE.finditer(p):
         segs.append(html.escape(p[last:mo.start()]))
         rel = mo.group(2)
-        f = Path(book_dir) / rel
+        f = Path(md_dir) / rel
         if f.exists():
             img_items[rel] = f.read_bytes()
             segs.append(f'<img src="{html.escape(rel)}" alt="illustration"/>')
@@ -516,8 +557,8 @@ def _epub_mime(name: str) -> str:
             os.path.splitext(name)[1].lower(), "image/jpeg")
 
 
-def _xhtml_page(title: str, paras: list[str], book_dir: Path, img_items: dict) -> str:
-    body = "\n".join(_para_to_xhtml(p, book_dir, img_items) for p in paras) or "<p><br/></p>"
+def _xhtml_page(title: str, paras: list[str], md_dir: Path, img_items: dict) -> str:
+    body = "\n".join(_para_to_xhtml(p, md_dir, img_items) for p in paras) or "<p><br/></p>"
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml"><head><title>{html.escape(title)}</title></head>
@@ -525,22 +566,32 @@ def _xhtml_page(title: str, paras: list[str], book_dir: Path, img_items: dict) -
 
 
 def write_epub(path: Path, book_title: str, author: str, chapters: list[tuple[str, list[str]]],
-               book_dir: Path) -> None:
+               md_dir: Path, cover_path=None) -> None:
     book_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     manifest, spine = [], []
+    cover_href = None
+    if cover_path is not None and Path(cover_path).exists():
+        cover_href = "cover" + os.path.splitext(str(cover_path))[1].lower()
+        manifest.append(f'<item id="cover" href="{cover_href}" media-type="{_epub_mime(cover_href)}"/>')
+        spine.append('<itemref idref="coverpage"/>')
     for i in range(len(chapters)):
         manifest.append(f'<item id="c{i}" href="ch{i:04d}.xhtml" media-type="application/xhtml+xml"/>')
         spine.append(f'<itemref idref="c{i}"/>')
+    cover_meta = '<meta name="cover" content="cover"/>' if cover_href else ""
+    guide = ('<guide><reference type="cover" title="Cover" href="cover.xhtml"/></guide>'
+             if cover_href else "")
+    if cover_href:
+        manifest.append('<item id="coverpage" href="cover.xhtml" media-type="application/xhtml+xml"/>')
     opf = f"""<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" unique-identifier="bookid" version="2.0">
 <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
 <dc:title>{html.escape(book_title)}</dc:title>
 <dc:creator>{html.escape(author or 'Foxaholic')}</dc:creator>
 <dc:language>en</dc:language><dc:identifier id="bookid">urn:uuid:{book_id}</dc:identifier>
-<dc:date>{now}</dc:date></metadata>
+<dc:date>{now}</dc:date>{cover_meta}</metadata>
 <manifest>{''.join(manifest)}<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/></manifest>
-<spine toc="ncx">{''.join(spine)}</spine></package>\n"""
+<spine toc="ncx">{''.join(spine)}</spine>{guide}</package>\n"""
     ncx_items = "".join(
         f'<navPoint id="np{i}" playOrder="{i+1}"><navLabel><text>{html.escape(t)}</text></navLabel>'
         f'<content src="ch{i:04d}.xhtml"/></navPoint>'
@@ -560,21 +611,32 @@ def write_epub(path: Path, book_title: str, author: str, chapters: list[tuple[st
         z.writestr("OEBPS/toc.ncx", ncx)
         img_items: dict = {}
         pages = []
+        if cover_href:
+            cover_xhtml = ("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                           '<html xmlns="http://www.w3.org/1999/xhtml"><head>'
+                           f"<title>Cover</title></head><body><div style=\"text-align:center\">"
+                           f"<img src=\"{html.escape(cover_href)}\" alt=\"cover\"/></div></body></html>\n")
+            pages.append(("OEBPS/cover.xhtml", cover_xhtml))
+            img_items[cover_href] = Path(cover_path).read_bytes()
         for i, (t, paras) in enumerate(chapters):
-            pages.append((f"OEBPS/ch{i:04d}.xhtml", _xhtml_page(t, paras, book_dir, img_items)))
+            pages.append((f"OEBPS/ch{i:04d}.xhtml", _xhtml_page(t, paras, md_dir, img_items)))
         for name, data in pages:
             z.writestr(name, data)
-        # image files + manifest entries (collected while rendering pages)
+        # image files + manifest entries (collected while rendering pages;
+        # the cover is already declared above, so skip it here)
         img_manifest = []
         for n, (rel, data) in enumerate(img_items.items()):
+            z.writestr("OEBPS/" + rel, data)
+            if rel == cover_href:
+                continue
             img_manifest.append(
                 f'<item id="img{n}" href="{html.escape(rel)}" media-type="{_epub_mime(rel)}"/>')
-            z.writestr("OEBPS/" + rel, data)
         opf = opf.replace("</manifest>", "".join(img_manifest) + "</manifest>")
         z.writestr("OEBPS/content.opf", opf)
 
 
-def write_pdf(path: Path, book_title: str, chapters: list[tuple[str, list[str]]]) -> None:
+def write_pdf(path: Path, book_title: str, chapters: list[tuple[str, list[str]]],
+              meta: dict | None = None, cover_path=None) -> None:
     """Combined PDF via fpdf2. Uses a system TTF so smart quotes etc. survive."""
     from fpdf import FPDF
 
@@ -639,9 +701,48 @@ def write_pdf(path: Path, book_title: str, chapters: list[tuple[str, list[str]]]
             return False
 
     book_dir = Path(path).parent
+    md_dir = book_dir / "md"
     pdf.add_page()
     pdf.set_font(font, "B", 20)
     pdf.multi_cell(0, 10, _tx(book_title), align="C")
+    if meta:
+        if cover_path is not None and Path(cover_path).exists():
+            try:
+                w = pdf.epw * 0.5
+                pdf.image(str(cover_path), x=pdf.l_margin + (pdf.epw - w) / 2, w=w)
+                pdf.ln(4)
+            except Exception:
+                pass
+        pdf.set_font(font, "", 11)
+        info = []
+        if meta.get("original_title"):
+            info.append(f"Original title: {meta['original_title']}")
+        if meta.get("author"):
+            info.append(f"Author: {', '.join(meta['author'])}")
+        if meta.get("team"):
+            info.append(f"Team: {', '.join(meta['team'])}")
+        if meta.get("status"):
+            info.append(f"Status: {meta['status']}")
+        if meta.get("translation"):
+            info.append(f"Translation: {meta['translation']}")
+        if meta.get("type"):
+            info.append(f"Type: {meta['type']}")
+        if meta.get("genres"):
+            info.append(f"Genres: {', '.join(meta['genres'])}")
+        if meta.get("tags"):
+            info.append(f"Tags: {', '.join(meta['tags'][:16])}")
+        info.append(f"Chapters: {len(chapters)}")
+        for line in info:
+            pdf.multi_cell(0, 6, _tx(line), align="C", new_x="LMARGIN")
+        if meta.get("synopsis"):
+            pdf.ln(4)
+            pdf.set_font(font, "B", 13)
+            pdf.cell(0, 8, "Synopsis")
+            pdf.ln(10)
+            pdf.set_font(font, "", 11)
+            for p in meta["synopsis"]:
+                pdf.multi_cell(0, 6, _tx(p))
+                pdf.ln(2)
     pdf.ln(10)
     for t, paras in chapters:
         pdf.add_page()
@@ -652,7 +753,7 @@ def write_pdf(path: Path, book_title: str, chapters: list[tuple[str, list[str]]]
         for p in paras:
             m = _IMG_MD_RE.fullmatch(p.strip())
             if m:
-                if not _pdf_image(book_dir / m.group(2)):
+                if not _pdf_image(md_dir / m.group(2)):
                     pdf.multi_cell(0, 6, _tx(f"[Image: {m.group(2)}]"))
                     pdf.ln(2)
                 continue
@@ -720,7 +821,7 @@ def _thread_session(cookies: list, ua: str):
     if s is None or getattr(_tls, "gen", None) != id(cookies):
         s = requests.Session()
         s.headers.update({
-            "User-Agent": ua or PLAYWRIGHT_UA,
+            "User-Agent": ua or DEFAULT_UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.foxaholic.com/",
@@ -787,24 +888,26 @@ def _process_chapter_html(html_text: str, page_url: str, idx: int, list_name: st
         sess = None
     lines: list[str] = []
     img_no = 0
+    md_dir = Path(book_dir) / "md"
+    md_dir.mkdir(parents=True, exist_ok=True)
     for kind, val in blocks:
         if kind == "p":
             lines.append(val)
             continue
         img_no += 1
-        rel = _download_image(sess, val, book_dir, idx, img_no)
+        rel = _download_image(sess, val, md_dir, idx, img_no)
         if rel:
             lines.append(f"![illustration]({rel})")
         else:
             lines.append(f"[Image unavailable: {val}]")
-    md_path = Path(book_dir) / f"chapter-{idx:04d}.md"
+    md_path = _md_path(book_dir, idx)
     md_path.write_text(f"{ctitle}\n\n" + "\n\n".join(lines) + "\n", encoding="utf-8")
     return (ctitle, lines)
 
 
 def _fetch_chapter_thread(url, idx, name, book_dir_s, cookies, ua, delay, novel_title=""):
     """Fetch+parse+save one chapter. Returns (idx, title, lines) or (idx, None, reason)."""
-    md_path = Path(book_dir_s) / f"chapter-{idx:04d}.md"
+    md_path = _md_path(book_dir_s, idx)
     if md_path.exists() and md_path.stat().st_size > 500:
         try:
             paras = _read_cached_md(md_path, name)
@@ -921,12 +1024,12 @@ def parse_args(argv=None):
     p.add_argument("--workers", type=int, default=1, help="Parallel chapter fetchers 1-100 (default 1 = sequential browser mode; try 4). Browser still solves Cloudflare; workers reuse its cookies.")
     p.add_argument("--refresh-retries", type=int, default=2, help="How many times to re-solve Cloudflare and retry failed chapters (default 2)")
     p.add_argument("--format", default="all", help="Comma list: epub,txt,md,pdf,all (default all)")
-    p.add_argument("--headed", action="store_true", help="Show browser window (use on first run to solve Cloudflare manually)")
-    p.add_argument("--uc", action="store_true", help="UC mode: SeleniumBase undetected-chromedriver instead of Playwright (stronger Cloudflare bypass; pip install seleniumbase)")
+    p.add_argument("--headed", action="store_true", help="Show browser window (solve Cloudflare manually if it won't clear headless)")
+    p.add_argument("--uc", action="store_true", help=argparse.SUPPRESS)  # deprecated: SB is always used now
+    p.add_argument("--user-data-dir", default=None, help=argparse.SUPPRESS)  # deprecated: SB uses a fresh profile
     p.add_argument("--list-only", action="store_true", help="Only list chapters, download nothing")
     p.add_argument("--timeout", type=int, default=120, help="Cloudflare wait timeout seconds (default 120)")
-    p.add_argument("--user-data-dir", default=None, help="Persistent browser profile dir (default: .foxaholic-profile next to script)")
-    p.add_argument("--chapter-timeout", type=int, default=45000, help="Per-page navigation timeout ms")
+    p.add_argument("--chapter-timeout", type=int, default=45000, help=argparse.SUPPRESS)
     return p.parse_args(argv)
 
 
@@ -963,8 +1066,24 @@ def main(argv=None) -> int:
             _close()
             return 3
 
-        title = extract_novel_title(page) or slug_from_url(args.url)
+        meta = extract_novel_meta(page)
+        title = meta["title"] or slug_from_url(args.url)
         print(f"[novel] title: {title}")
+        if meta["original_title"]:
+            print(f"[novel] original title: {meta['original_title']}")
+        print(f"[novel] author: {', '.join(meta['author']) or '?'}"
+              f" | team: {', '.join(meta['team']) or '?'}"
+              f" | status: {meta['status'] or '?'}"
+              f" | translation: {meta['translation'] or '?'}"
+              f" | type: {meta['type'] or '?'}")
+        if meta["genres"]:
+            print(f"[novel] genres: {', '.join(meta['genres'])}")
+        if meta["tags"]:
+            print(f"[novel] tags: {', '.join(meta['tags'][:12])}"
+                  f"{'...' if len(meta['tags']) > 12 else ''}")
+        if meta["synopsis"]:
+            print(f"[novel] synopsis: {meta['synopsis'][0][:240]}"
+                  f"{'...' if len(meta['synopsis'][0]) > 240 else ''}")
         chapters = extract_chapter_links(page, args.url)
         print(f"[novel] found {len(chapters)} chapter link(s)")
         if not chapters:
@@ -990,10 +1109,37 @@ def main(argv=None) -> int:
 
         book_dir = Path(args.output) / safe_filename(title)
         book_dir.mkdir(parents=True, exist_ok=True)
+        (book_dir / "md").mkdir(parents=True, exist_ok=True)
+        # migrate old flat layout (chapter-*.md + images/ at top level) into md/
+        try:
+            old_img = book_dir / "images"
+            new_img = book_dir / "md" / "images"
+            if old_img.is_dir() and not new_img.exists():
+                old_img.rename(new_img)
+        except Exception:
+            pass
         (book_dir / "metadata.json").write_text(
-            json.dumps({"title": title, "url": args.url, "chapter_count": len(selected),
-                        "downloaded_at": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False, indent=2),
+            json.dumps({**meta, "url": args.url, "chapter_count": len(selected),
+                        "downloaded_at": datetime.now(timezone.utc).isoformat()},
+                       ensure_ascii=False, indent=2),
             encoding="utf-8")
+
+        # cover image for the EPUB/PDF title pages
+        cover_path = None
+        if meta.get("cover_url"):
+            try:
+                csess = _thread_session(_get_cookies() or [], _ua)
+                cr = csess.get(meta["cover_url"], timeout=30)
+                ctype = ((cr.headers.get("Content-Type", "") if cr else "") or "").split(";")[0].strip().lower()
+                if cr is not None and cr.status_code == 200 and ctype.startswith("image/") and cr.content:
+                    ext = os.path.splitext(urlparse(meta["cover_url"]).path)[1].lower()
+                    if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+                        ext = ".jpg"
+                    cover_path = book_dir / f"cover{ext}"
+                    cover_path.write_bytes(cr.content)
+                    print(f"[novel] cover: {cover_path.name}")
+            except Exception as e:
+                print(f"[novel] cover download failed: {e}")
 
         collected: list[tuple[str, list[str]]] = []
         thr = None
@@ -1006,7 +1152,7 @@ def main(argv=None) -> int:
             collected = thr
         else:
             for idx, ch in enumerate(selected, start=lo + 1):
-                md_path = book_dir / f"chapter-{idx:04d}.md"
+                md_path = _md_path(book_dir, idx)
                 if md_path.exists() and md_path.stat().st_size > 500:
                     print(f"  [{idx}/{len(chapters)}] skip (cached): {ch['name']}")
                     try:
@@ -1044,22 +1190,44 @@ def main(argv=None) -> int:
         return 5
 
     base = safe_filename(title)
+    info_lines = [title]
+    if meta.get("original_title"):
+        info_lines.append(f"Original title: {meta['original_title']}")
+    if meta.get("author"):
+        info_lines.append(f"Author: {', '.join(meta['author'])}")
+    if meta.get("team"):
+        info_lines.append(f"Team: {', '.join(meta['team'])}")
+    if meta.get("status"):
+        info_lines.append(f"Status: {meta['status']}")
+    if meta.get("translation"):
+        info_lines.append(f"Translation: {meta['translation']}")
+    if meta.get("type"):
+        info_lines.append(f"Type: {meta['type']}")
+    if meta.get("genres"):
+        info_lines.append(f"Genres: {', '.join(meta['genres'])}")
+    if meta.get("tags"):
+        info_lines.append(f"Tags: {', '.join(meta['tags'])}")
+    info_lines.append(f"Chapters: {len(collected)}")
+    info_lines.append(f"Source: {args.url}")
     if "txt" in fmts:
         txt_path = book_dir / f"{base}.txt"
         with txt_path.open("w", encoding="utf-8") as f:
-            f.write(f"{title}\nSource: {args.url}\n\n")
+            f.write("\n".join(info_lines) + "\n")
+            if meta.get("synopsis"):
+                f.write("\nSynopsis:\n" + "\n\n".join(meta["synopsis"]) + "\n")
             for t, paras in collected:
                 f.write(f"\n\n{'='*20} {t} {'='*20}\n\n")
                 f.write("\n\n".join(_IMG_MD_RE.sub(r"[Image: \2]", p) for p in paras))
         print(f"[done] TXT : {txt_path}")
     if "epub" in fmts:
         epub_path = book_dir / f"{base}.epub"
-        write_epub(epub_path, title, "Foxaholic", collected, book_dir)
+        author = ", ".join(meta.get("author") or []) or "Foxaholic"
+        write_epub(epub_path, title, author, collected, book_dir / "md", cover_path)
         print(f"[done] EPUB: {epub_path}")
     if "pdf" in fmts:
         try:
             pdf_path = book_dir / f"{base}.pdf"
-            write_pdf(pdf_path, title, collected)
+            write_pdf(pdf_path, title, collected, meta, cover_path)
             print(f"[done] PDF : {pdf_path}")
         except ImportError:
             print("[done] PDF skipped: fpdf2 not installed (pip install fpdf2)", file=sys.stderr)

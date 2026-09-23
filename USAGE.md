@@ -41,9 +41,10 @@ Output lands in `out/<Novel Title>/`:
 
 ```text
 out/I Got a New Skill Every Time I Was Exiled.../
-  chapter-0001.md   # chapter-name line + body (also the resume cache)
-  ...
-  images/           # downloaded illustrations, referenced from the .md files
+  md/
+    chapter-0001.md   # chapter-name line + body (also the resume cache)
+    ...
+    images/           # illustrations, referenced from the .md files
   <Title>.txt       # whole novel, plain text ([Image: ...] placeholders)
   <Title>.epub      # e-reader format, images embedded
   <Title>.pdf       # one PDF, images embedded, new page per chapter
