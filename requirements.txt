@@ -1,0 +1,5 @@
+playwright>=1.40
+requests>=2.28  # for --workers mode
+fpdf2>=2.7  # for --format pdf
+# optional - only needed for --uc mode (undetected-chromedriver bypass):
+# seleniumbase>=4.0

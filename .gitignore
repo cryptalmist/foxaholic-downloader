@@ -1,0 +1,25 @@
+# Playwright persistent browser profile (Cloudflare cookies, regenerable)
+.foxaholic-profile/
+
+# SeleniumBase default download dir (created automatically per run)
+downloaded_files/
+
+# Downloaded novels and test output
+out/
+test_out/
+*.epub
+*.pdf
+
+# Per-chapter cache and images (regenerable via resume)
+/**/chapter-*.md
+/**/images/
+
+# Debug artifacts
+debug_novel.png
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
